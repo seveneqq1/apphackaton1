@@ -1,8 +1,9 @@
-"""ErgoNeck: ArUco-based posture reminder prototype for a laptop camera."""
+"""ErgoNeck: four-black-dot posture reminder prototype for a laptop camera."""
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import math
 import time
 from collections import deque
@@ -16,8 +17,11 @@ from PIL import Image, ImageDraw, ImageFont
 
 @dataclass(frozen=True)
 class Settings:
-    marker_id: int = 0
-    marker_size_mm: float = 45.0
+    dots_width_mm: float = 135.0
+    dots_height_mm: float = 45.0
+    dot_threshold: int = 75
+    dot_min_area_px: float = 80.0
+    dot_max_area_px: float = 5000.0
     forward_axis: int = 0  # x axis is normally the head nod axis for a front-facing camera.
     forward_sign: float = 1.0  # Change to -1 if looking down displays a negative angle.
     warning_angle: float = 15.0
@@ -72,26 +76,89 @@ def load_calibration(path: Path, width: int, height: int) -> tuple[np.ndarray, n
     return camera_matrix, np.zeros((5, 1), dtype=np.float64), False
 
 
-def find_marker(frame: np.ndarray, marker_id: int):
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-    parameters = cv2.aruco.DetectorParameters() if hasattr(cv2.aruco, "DetectorParameters") else cv2.aruco.DetectorParameters_create()
-    if hasattr(cv2.aruco, "ArucoDetector"):
-        corners, ids, _ = cv2.aruco.ArucoDetector(dictionary, parameters).detectMarkers(frame)
-    else:
-        corners, ids, _ = cv2.aruco.detectMarkers(frame, dictionary, parameters=parameters)
-    if ids is None:
+def order_dot_corners(points: np.ndarray) -> np.ndarray:
+    """Order four image points as top-left, top-right, bottom-right, bottom-left."""
+    ordered = np.zeros((4, 2), dtype=np.float64)
+    sums = points.sum(axis=1)
+    differences = points[:, 0] - points[:, 1]
+    ordered[0] = points[np.argmin(sums)]
+    ordered[2] = points[np.argmax(sums)]
+    ordered[1] = points[np.argmax(differences)]
+    ordered[3] = points[np.argmin(differences)]
+    return ordered
+
+
+def select_dot_quad(candidates: list[tuple[np.ndarray, float]], expected_ratio: float) -> np.ndarray | None:
+    """Choose four similarly sized circular blobs forming the glasses-dot quadrilateral."""
+    if len(candidates) < 4:
         return None
-    matches = np.where(ids.flatten() == marker_id)[0]
-    return corners[int(matches[0])] if len(matches) else None
+    candidates = sorted(candidates, key=lambda item: item[1], reverse=True)[:12]
+    best_points: np.ndarray | None = None
+    best_score = -float("inf")
+    for group in itertools.combinations(candidates, 4):
+        points = order_dot_corners(np.array([item[0] for item in group], dtype=np.float64))
+        contour = points.astype(np.float32).reshape(-1, 1, 2)
+        if not cv2.isContourConvex(contour):
+            continue
+        area = abs(cv2.contourArea(contour))
+        sides = np.array([np.linalg.norm(points[(index + 1) % 4] - points[index]) for index in range(4)])
+        if area < 500 or sides.min() < 12:
+            continue
+        observed_ratio = (sides[0] + sides[2]) / (sides[1] + sides[3])
+        if not 0.35 * expected_ratio <= observed_ratio <= 2.8 * expected_ratio:
+            continue
+        dot_areas = np.array([item[1] for item in group])
+        equal_size = 1.0 / (1.0 + float(np.std(dot_areas) / np.mean(dot_areas)))
+        shape_match = 1.0 / (1.0 + abs(math.log(observed_ratio / expected_ratio)))
+        score = area * equal_size * shape_match
+        if score > best_score:
+            best_score = score
+            best_points = points
+    return best_points
 
 
-def estimate_rotation(corners: np.ndarray, camera_matrix: np.ndarray, distortion: np.ndarray, marker_size_mm: float) -> np.ndarray | None:
-    half = marker_size_mm / 2
+def find_four_dots(
+    frame: np.ndarray, threshold: int, min_area: float, max_area: float, expected_ratio: float
+) -> np.ndarray | None:
+    """Find four solid black circular dots; their centres become the pose reference points."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, black = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
+    black = cv2.morphologyEx(black, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    contours, _ = cv2.findContours(black, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates: list[tuple[np.ndarray, float]] = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if not min_area <= area <= max_area:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter == 0:
+            continue
+        circularity = 4 * math.pi * area / (perimeter * perimeter)
+        _, _, width, height = cv2.boundingRect(contour)
+        aspect_ratio = width / height if height else 0
+        if circularity < 0.62 or not 0.7 <= aspect_ratio <= 1.35:
+            continue
+        moments = cv2.moments(contour)
+        if moments["m00"] == 0:
+            continue
+        candidates.append((np.array([moments["m10"] / moments["m00"], moments["m01"] / moments["m00"]]), area))
+    return select_dot_quad(candidates, expected_ratio)
+
+
+def estimate_rotation(dot_points: np.ndarray, camera_matrix: np.ndarray, distortion: np.ndarray, width_mm: float, height_mm: float) -> np.ndarray | None:
+    half_width, half_height = width_mm / 2, height_mm / 2
     object_points = np.array(
-        [[-half, half, 0], [half, half, 0], [half, -half, 0], [-half, -half, 0]], dtype=np.float64
+        [
+            [-half_width, half_height, 0],
+            [half_width, half_height, 0],
+            [half_width, -half_height, 0],
+            [-half_width, -half_height, 0],
+        ],
+        dtype=np.float64,
     )
-    image_points = corners.reshape(4, 2).astype(np.float64)
-    success, rvec, _ = cv2.solvePnP(object_points, image_points, camera_matrix, distortion, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+    image_points = dot_points.reshape(4, 2).astype(np.float64)
+    success, rvec, _ = cv2.solvePnP(object_points, image_points, camera_matrix, distortion, flags=cv2.SOLVEPNP_ITERATIVE)
     if not success or not np.isfinite(rvec).all():
         return None
     return cv2.Rodrigues(rvec)[0]
@@ -117,8 +184,7 @@ def average_rotations(rotations: list[np.ndarray]) -> np.ndarray:
 def signed_forward_angle(rotation: np.ndarray, reference: np.ndarray, axis: int, sign: float) -> float:
     """Return one configured component of the relative rotation vector in degrees.
 
-    Unlike an image-edge slope, this uses 3D pose from solvePnP. The sign is
-    intentionally configurable because the physical marker can be mounted in either orientation.
+    Unlike an image-edge slope, this uses a 3D pose from the four dot centres.
     """
     relative = rotation @ reference.T
     rvec, _ = cv2.Rodrigues(relative)
@@ -146,18 +212,18 @@ class PostureState:
         self.warning = False
         self.message = "Калибровка: смотрите прямо и не двигайтесь"
 
-    def marker_lost(self) -> None:
+    def dots_lost(self) -> None:
         self.over_since = None
         self.back_since = None
         self.warning = False
-        # A newly visible marker must not be mixed with values collected before an occlusion.
+        # A newly visible dot set must not be mixed with values collected before an occlusion.
         self.recent_angles.clear()
         if self.calibration_started is not None:
             self.calibration_started = None
             self.calibration_rotations = []
-            self.message = "Калибровка прервана: метка пропала. Нажмите C ещё раз"
+            self.message = "Калибровка прервана: точки пропали. Нажмите C ещё раз"
         else:
-            self.message = "Метки не видны"
+            self.message = "Точки не видны"
 
     def update(self, rotation: np.ndarray, now: float) -> float | None:
         if self.calibration_started is not None:
@@ -237,17 +303,25 @@ def draw_interface(frame: np.ndarray, state: PostureState, angle: float | None, 
 def main() -> None:
     parser = argparse.ArgumentParser(description="ErgoNeck posture prototype")
     parser.add_argument("--camera", type=int, default=0, help="Camera index (default: 0)")
-    parser.add_argument("--marker-id", type=int, default=SETTINGS.marker_id)
-    parser.add_argument("--marker-size-mm", type=float, default=SETTINGS.marker_size_mm,
-                        help="INNER black-and-white square side; not its white border")
+    parser.add_argument("--dots-width-mm", type=float, default=SETTINGS.dots_width_mm,
+                        help="Distance between centres of left and right dots")
+    parser.add_argument("--dots-height-mm", type=float, default=SETTINGS.dots_height_mm,
+                        help="Distance between centres of upper and lower dots")
+    parser.add_argument("--dot-threshold", type=int, default=SETTINGS.dot_threshold,
+                        help="Pixels darker than this are treated as black (0-255)")
     parser.add_argument("--calibration", type=Path, default=Path("camera_calibration.npz"))
     parser.add_argument("--forward-sign", type=float, choices=(-1.0, 1.0), default=SETTINGS.forward_sign,
                         help="Use -1 when lowering the head gives a negative value")
     args = parser.parse_args()
-    if args.marker_size_mm <= 0:
-        parser.error("--marker-size-mm must be positive")
+    if args.dots_width_mm <= 0 or args.dots_height_mm <= 0 or not 0 <= args.dot_threshold <= 255:
+        parser.error("dot dimensions must be positive and --dot-threshold must be between 0 and 255")
 
-    settings = Settings(marker_id=args.marker_id, marker_size_mm=args.marker_size_mm, forward_sign=args.forward_sign)
+    settings = Settings(
+        dots_width_mm=args.dots_width_mm,
+        dots_height_mm=args.dots_height_mm,
+        dot_threshold=args.dot_threshold,
+        forward_sign=args.forward_sign,
+    )
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         raise RuntimeError(f"Не удалось открыть камеру {args.camera}. Проверьте доступ к камере и индекс --camera.")
@@ -269,15 +343,27 @@ def main() -> None:
                 print(f"Camera model: {source}")
 
             now = time.monotonic()
-            corners = find_marker(frame, settings.marker_id)
+            dots = find_four_dots(
+                frame,
+                settings.dot_threshold,
+                settings.dot_min_area_px,
+                settings.dot_max_area_px,
+                settings.dots_width_mm / settings.dots_height_mm,
+            )
             angle: float | None = None
-            if corners is None:
-                state.marker_lost()
+            if dots is None:
+                state.dots_lost()
             else:
-                cv2.polylines(frame, [corners.astype(np.int32)], True, (0, 255, 0), 3, cv2.LINE_AA)
-                rotation = estimate_rotation(corners, camera_matrix, distortion, settings.marker_size_mm)
+                cv2.polylines(frame, [dots.astype(np.int32)], True, (0, 255, 0), 3, cv2.LINE_AA)
+                for index, point in enumerate(dots.astype(np.int32), start=1):
+                    cv2.circle(frame, tuple(point), 8, (0, 255, 0), 2, cv2.LINE_AA)
+                    cv2.putText(frame, str(index), tuple(point + np.array([10, -10])), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                (0, 255, 0), 2, cv2.LINE_AA)
+                rotation = estimate_rotation(
+                    dots, camera_matrix, distortion, settings.dots_width_mm, settings.dots_height_mm
+                )
                 if rotation is None:
-                    state.marker_lost()
+                    state.dots_lost()
                 else:
                     angle = state.update(rotation, now)
 
